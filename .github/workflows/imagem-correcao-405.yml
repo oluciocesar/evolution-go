@@ -8,7 +8,8 @@
 # https://github.com/evolution-foundation/evolution-go/pull/227
 #
 # Antes de a etiqueta existir, cada arquitetura e ligada numa rede sem
-# internet, com um banco de teste, e precisa responder /server/ok.
+# internet, com um banco de teste, e precisa responder /server/ok; e o
+# programa precisa ter a linha de log da correcao, que a 0.7.2 oficial nao tem.
 #
 # Quando sair uma versao oficial com a correcao, voltar para a imagem
 # evoapicloud/evolution-go.
@@ -31,6 +32,7 @@ jobs:
   construir:
     name: Construir e ligar (${{ matrix.nome }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - nome: amd64
@@ -82,6 +84,7 @@ jobs:
             -e POSTGRES_USERS_DB='postgresql://postgres:teste@banco:5432/evogo_users?sslmode=disable' \
             -e POSTGRES_AUTH_DB='postgresql://postgres:teste@banco:5432/evogo_auth?sslmode=disable' \
             -e GLOBAL_API_KEY=chave-do-teste \
+            -e DATABASE_SAVE_MESSAGES=false \
             -e CONNECT_ON_STARTUP=true \
             "$IMAGEM_DIGEST"
           resposta=''
@@ -95,6 +98,17 @@ jobs:
           docker cp evo:/app/server ./server
           echo "linhas da correcao no programa: $(grep -a -c 'Applied whatsmeow store.SetWAVersion' ./server)"
           grep -a -q 'Applied whatsmeow store.SetWAVersion' ./server
+
+      - name: Calibrar a conferencia na 0.7.2 oficial (la a linha nao pode existir)
+        run: |
+          docker pull -q --platform '${{ matrix.plataforma }}' evoapicloud/evolution-go:0.7.2
+          id=$(docker create --platform '${{ matrix.plataforma }}' evoapicloud/evolution-go:0.7.2)
+          docker cp "$id:/app/server" ./server-oficial
+          docker rm "$id" > /dev/null
+          if grep -a -q 'Applied whatsmeow store.SetWAVersion' ./server-oficial; then
+            echo "a 0.7.2 oficial tambem tem a linha: a conferencia nao distingue"; exit 1
+          fi
+          echo "0.7.2 oficial: nenhuma linha da correcao (a conferencia distingue)"
 
       - name: Guardar o digest
         run: |
