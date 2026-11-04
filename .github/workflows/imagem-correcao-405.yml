@@ -1,0 +1,138 @@
+# Imagem do Evolution Go 0.7.2 com a correcao do "Client outdated (405)".
+#
+# Desde 02/11/2026 o WhatsApp recusa a versao de cliente embutida na 0.7.2
+# oficial (2.3000.1042386815): conexao nova nao gera QR e conexao que cai nao
+# volta. O codigo deste ramo e a tag oficial 0.7.2 mais o commit b7350a7 do
+# PR #227 (5 linhas em pkg/whatsmeow/service/whatsmeow.go): o servidor passa
+# a se apresentar ao WhatsApp com a versao que ele ja busca no WhatsApp Web.
+# https://github.com/evolution-foundation/evolution-go/pull/227
+#
+# Antes de a etiqueta existir, cada arquitetura e ligada numa rede sem
+# internet, com um banco de teste, e precisa responder /server/ok.
+#
+# Quando sair uma versao oficial com a correcao, voltar para a imagem
+# evoapicloud/evolution-go.
+name: Imagem com a correcao do 405
+
+on:
+  push:
+    branches: [correcao-405]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGEM: ghcr.io/oluciocesar/evolution-go
+  ETIQUETA: 0.7.2-correcao-405
+
+jobs:
+  construir:
+    name: Construir e ligar (${{ matrix.nome }})
+    strategy:
+      matrix:
+        include:
+          - nome: amd64
+            plataforma: linux/amd64
+            maquina: ubuntu-24.04
+          - nome: arm64
+            plataforma: linux/arm64
+            maquina: ubuntu-24.04-arm
+    runs-on: ${{ matrix.maquina }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: A correcao do PR 227 esta no codigo
+        run: grep -n 'store.SetWAVersion(store.WAVersionContainer' pkg/whatsmeow/service/whatsmeow.go
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir e enviar so pelo digest (a etiqueta vem depois do teste)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.plataforma }}
+          build-args: VERSION=0.7.2
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Evolution Go 0.7.2 com a correcao do 405 (PR 227)
+          outputs: type=image,name=${{ env.IMAGEM }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Ligar a imagem numa rede sem internet e esperar /server/ok
+        env:
+          IMAGEM_DIGEST: ${{ env.IMAGEM }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull -q "$IMAGEM_DIGEST"
+          docker network create --internal rede-teste
+          docker run -d --name banco --network rede-teste -e POSTGRES_PASSWORD=teste postgres:16-alpine
+          for i in $(seq 1 30); do docker exec banco pg_isready -U postgres -q && break; sleep 1; done
+          docker run -d --name evo --network rede-teste \
+            -e SERVER_PORT=8080 \
+            -e POSTGRES_USERS_DB='postgresql://postgres:teste@banco:5432/evogo_users?sslmode=disable' \
+            -e POSTGRES_AUTH_DB='postgresql://postgres:teste@banco:5432/evogo_auth?sslmode=disable' \
+            -e GLOBAL_API_KEY=chave-do-teste \
+            -e CONNECT_ON_STARTUP=true \
+            "$IMAGEM_DIGEST"
+          resposta=''
+          for i in $(seq 1 90); do
+            resposta=$(docker exec evo wget -qO- http://127.0.0.1:8080/server/ok 2>/dev/null) && break
+            sleep 1
+          done
+          echo "----- registro do servidor"; docker logs evo 2>&1 | tail -n 40
+          echo "----- /server/ok respondeu: $resposta"
+          test "$resposta" = '{"status":"ok"}'
+          docker cp evo:/app/server ./server
+          echo "linhas da correcao no programa: $(grep -a -c 'Applied whatsmeow store.SetWAVersion' ./server)"
+          grep -a -q 'Applied whatsmeow store.SetWAVersion' ./server
+
+      - name: Guardar o digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest='${{ steps.build.outputs.digest }}'
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.nome }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publicar:
+    name: Publicar a etiqueta
+    needs: construir
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Juntar as duas arquiteturas na etiqueta
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGEM:$ETIQUETA" \
+            -t "$IMAGEM:$ETIQUETA-${GITHUB_SHA::7}" \
+            $(printf "$IMAGEM@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGEM:$ETIQUETA"
